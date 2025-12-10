@@ -3,6 +3,7 @@
 use crate::internal::numpy::validate_points;
 use crate::{Error, Result};
 use nalgebra::DMatrix;
+use std::sync::Arc;
 
 /// A detection to be tracked.
 ///
@@ -24,8 +25,10 @@ pub struct Detection {
     /// Optional embedding vector for re-identification.
     pub embedding: Option<Vec<f64>>,
 
-    /// Optional arbitrary user data.
-    pub data: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// Optional arbitrary user data - shared via Arc for same-instance semantics.
+    /// When Detection is cloned, this Arc is cloned (shared reference, not deep copy),
+    /// so mutations to the underlying data are visible in all copies.
+    pub data: Option<Arc<dyn std::any::Any + Send + Sync>>,
 
     /// Points in absolute coordinates (set by tracker when using camera motion).
     pub(crate) absolute_points: Option<DMatrix<f64>>,
@@ -134,7 +137,7 @@ impl Clone for Detection {
             scores: self.scores.clone(),
             label: self.label.clone(),
             embedding: self.embedding.clone(),
-            data: None, // User data is not cloned
+            data: self.data.clone(), // Arc::clone - SHARED reference, same-instance semantics
             absolute_points: self.absolute_points.clone(),
             age: self.age,
         }

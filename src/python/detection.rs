@@ -5,9 +5,42 @@ use numpy::ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::any::Any;
 use std::sync::{Arc, RwLock};
 
 use crate::Detection;
+
+/// Wrapper to hold Python data in Rust Detection.data field.
+/// Implements Any + Send + Sync so it can be stored in Detection.
+///
+/// This enables same-instance semantics: when Detection is cloned,
+/// the Arc containing PyDataWrapper is cloned (shared reference),
+/// so mutations to the Python object are visible in all copies.
+pub struct PyDataWrapper {
+    inner: Py<PyAny>,
+}
+
+impl PyDataWrapper {
+    pub fn new(data: Py<PyAny>) -> Self {
+        Self { inner: data }
+    }
+
+    pub fn get(&self, py: Python<'_>) -> Py<PyAny> {
+        self.inner.clone_ref(py)
+    }
+}
+
+// SAFETY: Py<PyAny> is Send + Sync when the GIL is held during access.
+// All access to PyDataWrapper happens through Python::with_gil or methods
+// that receive Python<'_>, ensuring the GIL is held.
+unsafe impl Send for PyDataWrapper {}
+unsafe impl Sync for PyDataWrapper {}
+
+impl std::fmt::Debug for PyDataWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyDataWrapper").finish_non_exhaustive()
+    }
+}
 
 /// A detection to be tracked.
 ///
@@ -15,42 +48,48 @@ use crate::Detection;
 /// and optional metadata like scores, labels, and embeddings.
 ///
 /// Compatible with norfair.drawing functions via duck-typing.
+///
+/// The `data` field is stored inside Detection.data as an Arc<PyDataWrapper>.
+/// When Detection is cloned, this Arc is shared (not deep-copied),
+/// enabling same-instance semantics for mutations.
 #[pyclass(name = "Detection")]
 pub struct PyDetection {
     pub(crate) inner: Arc<RwLock<Detection>>,
-    /// Optional arbitrary user data (stored as Python object).
-    pub(crate) data: Option<Py<PyAny>>,
 }
 
 impl Clone for PyDetection {
     fn clone(&self) -> Self {
-        // Clone without the GIL-dependent data field is safe since Py<PyAny> is reference-counted
-        // and we need to use Python::with_gil to clone properly
-        Python::with_gil(|py| Self {
+        Self {
             inner: self.inner.clone(),
-            data: self.data.as_ref().map(|obj| obj.clone_ref(py)),
-        })
+        }
     }
 }
 
 impl PyDetection {
     /// Create a new PyDetection wrapping a Rust Detection.
+    /// Detection.data Arc is preserved (shared reference).
     pub fn from_detection(det: Detection) -> Self {
         Self {
             inner: Arc::new(RwLock::new(det)),
-            data: None,
         }
     }
 
-    /// Create a new PyDetection with data.
-    pub fn from_detection_with_data(det: Detection, data: Option<Py<PyAny>>) -> Self {
+    /// Create a new PyDetection with data stored in Detection.data.
+    pub fn from_detection_with_data(
+        py: Python<'_>,
+        mut det: Detection,
+        data: Option<Py<PyAny>>,
+    ) -> Self {
+        if let Some(d) = data {
+            det.data = Some(Arc::new(PyDataWrapper::new(d)));
+        }
         Self {
             inner: Arc::new(RwLock::new(det)),
-            data,
         }
     }
 
     /// Get a clone of the inner Detection.
+    /// The Arc data is shared through cloning.
     pub fn get_detection(&self) -> Detection {
         self.inner.read().unwrap().clone()
     }
@@ -168,7 +207,7 @@ impl PyDetection {
         let det = Detection::with_config(points_matrix, scores_vec, label, embedding_vec)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        Ok(Self::from_detection_with_data(det, data))
+        Ok(Self::from_detection_with_data(py, det, data))
     }
 
     /// The detection points as a numpy array of shape (n_points, n_dims).
@@ -199,9 +238,21 @@ impl PyDetection {
     }
 
     /// Optional arbitrary user data.
+    /// Stored in Detection.data as Arc<PyDataWrapper> for same-instance semantics.
     #[getter]
     fn data(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        self.data.as_ref().map(|obj| obj.clone_ref(py))
+        let det = self.inner.read().unwrap();
+        det.data.as_ref().and_then(|arc| {
+            arc.downcast_ref::<PyDataWrapper>()
+                .map(|wrapper| wrapper.get(py))
+        })
+    }
+
+    /// Set arbitrary user data.
+    #[setter]
+    fn set_data(&self, py: Python<'_>, value: Option<Py<PyAny>>) {
+        let mut det = self.inner.write().unwrap();
+        det.data = value.map(|d| Arc::new(PyDataWrapper::new(d)) as Arc<dyn Any + Send + Sync>);
     }
 
     /// Frame age of this detection (set by tracker during update).

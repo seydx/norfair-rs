@@ -39,15 +39,9 @@ pub struct PyTrackedObject {
 
 impl PyTrackedObject {
     /// Create a PyTrackedObject from a reference to a Rust TrackedObject.
-    pub fn from_tracked_object(obj: &TrackedObject) -> Self {
-        Self::from_tracked_object_with_transform(obj, None)
-    }
-
-    /// Create a PyTrackedObject with an optional coordinate transformation.
-    pub fn from_tracked_object_with_transform(
-        obj: &TrackedObject,
-        coord_transform: Option<Py<PyAny>>,
-    ) -> Self {
+    /// Detection.data Arc is preserved through cloning, enabling same-instance semantics.
+    pub fn from_tracked_object(obj: &TrackedObject, coord_transform: Option<Py<PyAny>>) -> Self {
+        // Detection.data Arc is shared through cloning - mutations propagate
         let last_detection = obj
             .last_detection
             .as_ref()

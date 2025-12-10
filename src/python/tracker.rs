@@ -197,11 +197,11 @@ impl PyTracker {
         period: i32,
         coord_transformations: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PyTrackedObject>> {
-        // Keep reference to original PyDetections so we can update them in-place
         let py_detections = detections.unwrap_or_default();
 
-        // Convert detections
-        let rust_detections: Vec<Detection> =
+        // Convert PyDetections to Rust Detections
+        // The Arc data in Detection.data is preserved through cloning
+        let mut rust_detections: Vec<Detection> =
             py_detections.iter().map(|d| d.get_detection()).collect();
 
         // Extract coordinate transformation
@@ -209,22 +209,22 @@ impl PyTracker {
         let transform_ref: Option<&dyn crate::camera_motion::CoordinateTransformation> =
             transform.as_ref().map(|t| t.as_transform());
 
-        // If we have a coordinate transformation, update the original PyDetection objects
-        // with their absolute_points (like Python norfair does)
+        // If we have a coordinate transformation, update detection absolute_points
         if let Some(ref t) = transform {
-            for py_det in &py_detections {
-                let det = py_det.inner.read().unwrap();
-                let abs_points = t.as_transform().rel_to_abs(&det.points);
-                drop(det); // Release read lock
+            for (py_det, rust_det) in py_detections.iter().zip(rust_detections.iter_mut()) {
+                let abs_points = t.as_transform().rel_to_abs(&rust_det.points);
+                // Update the PyDetection's inner detection
                 py_det
                     .inner
                     .write()
                     .unwrap()
-                    .set_absolute_points(abs_points);
+                    .set_absolute_points(abs_points.clone());
+                // Also set on the rust detection we're about to pass to the tracker
+                rust_det.set_absolute_points(abs_points);
             }
         }
 
-        // Update tracker - works for both builtin and custom distance functions
+        // Update tracker
         let tracked = self.inner.update(rust_detections, period, transform_ref);
 
         // Get Python coordinate transformation reference if provided
@@ -232,11 +232,11 @@ impl PyTracker {
             .filter(|obj| !obj.is_none())
             .map(|obj| obj.clone().unbind());
 
-        // Convert to Python objects, passing the coordinate transformation
+        // Convert to Python objects - Detection.data Arc is preserved through cloning
         let py_tracked: Vec<PyTrackedObject> = tracked
             .into_iter()
             .map(|obj| {
-                PyTrackedObject::from_tracked_object_with_transform(
+                PyTrackedObject::from_tracked_object(
                     obj,
                     py_coord_transform.as_ref().map(|t| t.clone_ref(py)),
                 )
@@ -255,7 +255,7 @@ impl PyTracker {
             .tracked_objects
             .iter()
             .filter(|obj| !obj.is_initializing)
-            .map(|obj| PyTrackedObject::from_tracked_object(obj))
+            .map(|obj| PyTrackedObject::from_tracked_object(obj, None))
             .collect()
     }
 
@@ -283,7 +283,7 @@ impl PyTracker {
         self.inner
             .tracked_objects
             .iter()
-            .map(|obj| PyTrackedObject::from_tracked_object(obj))
+            .map(|obj| PyTrackedObject::from_tracked_object(obj, None))
             .collect()
     }
 

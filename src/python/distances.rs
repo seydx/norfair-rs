@@ -42,7 +42,7 @@ impl PyDistanceEnum {
                 for (i, cand) in candidates.iter().enumerate() {
                     for (j, obj) in objects.iter().enumerate() {
                         let py_det = PyDetection::from_detection((*cand).clone());
-                        let py_obj = PyTrackedObject::from_tracked_object(obj);
+                        let py_obj = PyTrackedObject::from_tracked_object(obj, None);
 
                         let distance: f64 = func.call1(py, (py_det, py_obj))?.extract(py)?;
                         result[(i, j)] = distance;
@@ -507,7 +507,7 @@ pub fn create_custom_distance_from_callable(
                 for (o, obj) in objects.iter().enumerate() {
                     // Convert Rust types to Python objects
                     let py_det = PyDetection::from_detection((*cand).clone());
-                    let py_obj = PyTrackedObject::from_tracked_object(obj);
+                    let py_obj = PyTrackedObject::from_tracked_object(obj, None);
 
                     // Call the Python callable
                     match callable.call1(py, (py_det, py_obj)) {
