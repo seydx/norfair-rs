@@ -53,6 +53,18 @@ Cross-language performance comparison (IoU distance, OptimizedKalmanFilter):
 
 Benchmarks run on Apple M3 Pro. See `examples/benchmark/` for reproduction scripts.
 
+### Comparison
+
+Play around with the norfair (python) vs norfair-rs (rust) comparison tool using:
+
+```bash
+uv run examples/compare_norfair_py_rs.py
+```
+
+<p align="center">
+  <img src="docs/compare.png" style="max-width: 640px;" />
+</p>
+
 ---
 
 ## Installation
