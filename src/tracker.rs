@@ -215,8 +215,46 @@ impl Tracker {
             // Kalman predict
             obj.filter.predict();
 
-            // Update estimate from filter
-            obj.estimate = obj.filter.get_state();
+            // REBASE: if the incoming coordinate transformation differs
+            // from the one previously stored on this object, convert the
+            // filter's position state from the OLD absolute frame into
+            // the NEW absolute frame. Without this step, the filter's
+            // state accumulated under a previous transform (or under the
+            // identity "no transform" state from before any transform was
+            // ever supplied) would mismatch incoming detections after a
+            // sudden reference change — IoU distances explode, tracks
+            // break, output positions jump wildly.
+            //
+            // Generic recipe for any CoordinateTransformation:
+            //   rel      = old.abs_to_rel(state_in_old_abs)
+            //   state'   = new.rel_to_abs(rel)
+            //
+            // Velocity is left untouched here: for translation-only
+            // transforms the scene shift cancels in the derivative, and
+            // the filter will re-converge on velocity within a few
+            // frames via subsequent measurements. For the None → Some
+            // transition (no transform was active previously), `state`
+            // is in the identity (relative) frame, so we can feed it
+            // straight into `new.rel_to_abs`.
+            if let Some(new_transform) = coord_transform {
+                let rebased = match obj.last_coord_transform.as_ref() {
+                    Some(old_transform) => {
+                        let rel = old_transform.abs_to_rel(&obj.filter.get_state());
+                        new_transform.rel_to_abs(&rel)
+                    }
+                    None => new_transform.rel_to_abs(&obj.filter.get_state()),
+                };
+                Self::set_filter_position(&mut obj.filter, &rebased);
+            }
+
+            // Update estimate from filter (in ABSOLUTE frame; the
+            // `estimate` *field* tracks RELATIVE coordinates to match
+            // Python norfair — convert via `abs_to_rel` below).
+            let abs_state = obj.filter.get_state();
+            obj.estimate = match coord_transform {
+                Some(t) => t.abs_to_rel(&abs_state),
+                None => abs_state,
+            };
 
             // Update velocity estimate
             let state = obj.filter.get_state_vector();
@@ -452,8 +490,14 @@ impl Tracker {
         let measurement = DVector::from_vec(to_row_major_vec(detection.get_absolute_points()));
         obj.filter.update(&measurement, None, h.as_ref());
 
-        // Update estimate
-        obj.estimate = obj.filter.get_state();
+        // Update estimate — convert filter's absolute state back to
+        // relative coordinates so `obj.estimate` keeps the Python-norfair
+        // semantics (always relative / image-frame).
+        let abs_state = obj.filter.get_state();
+        obj.estimate = match obj.last_coord_transform.as_ref() {
+            Some(t) => t.abs_to_rel(&abs_state),
+            None => abs_state,
+        };
 
         // Store detection
         obj.last_detection = Some(detection.clone());
@@ -536,6 +580,35 @@ impl Tracker {
         }
 
         self.tracked_objects.push(obj);
+    }
+
+    /// Overwrite the position components of the filter's state vector
+    /// while preserving velocity components. Used for coordinate-frame
+    /// rebasing when the incoming `CoordinateTransformation` differs
+    /// from the one the filter state was previously accumulating in.
+    fn set_filter_position(filter: &mut crate::filter::FilterEnum, new_position: &DMatrix<f64>) {
+        let dim_z = filter.dim_z();
+        let dim_x = filter.dim_x();
+        let mut state = DVector::zeros(dim_x);
+        {
+            let current = filter.get_state_vector();
+            for i in 0..dim_x {
+                state[i] = current[i];
+            }
+        }
+        // Filter state is laid out as row-major positions followed by
+        // row-major velocities; overwrite only the leading `dim_z` slots.
+        let rows = new_position.nrows();
+        let cols = new_position.ncols();
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c;
+                if idx < dim_z {
+                    state[idx] = new_position[(r, c)];
+                }
+            }
+        }
+        filter.set_state_vector(&state);
     }
 
     // Internal: build observation matrix for partial observations
@@ -1206,5 +1279,129 @@ mod tests {
 
         // Objects should have different IDs (from different global ID pools)
         // Note: This depends on implementation - Rust uses factory pattern
+    }
+
+    /// When a CoordinateTransformation starts being applied mid-track (i.e.
+    /// the previous frame had no transform, and this one does), the filter
+    /// state that was accumulated in the "identity" frame must be rebased
+    /// into the new absolute frame. Without rebasing, the first match
+    /// after the transition sees the predicted state in the old frame and
+    /// the measurement in the new frame, which for a significant movement
+    /// vector means the track either fails to match or matches with a
+    /// filter state that drifts far outside the valid image range.
+    #[test]
+    fn test_rebasing_on_transform_introduction_keeps_relative_position_stable() {
+        use crate::camera_motion::TranslationTransformation;
+
+        let mut config = TrackerConfig::from_distance_name("iou", 0.9);
+        config.hit_counter_max = 5;
+        config.initialization_delay = 0;
+        let mut tracker = Tracker::new(config).unwrap();
+
+        // Frame 1: no transform at all. A box centered at image (0.5, 0.5).
+        let det1 = Detection::new(nalgebra::DMatrix::from_row_slice(
+            1,
+            4,
+            &[0.4, 0.4, 0.6, 0.6],
+        ))
+        .unwrap();
+        let active = tracker.update(vec![det1], 1, None);
+        assert_eq!(active.len(), 1, "Track should exist after frame 1");
+        let id_before = active[0].global_id;
+
+        // Frame 2: camera has panned such that a static world feature now
+        // appears shifted by (-0.3, 0) in the image. The detector still
+        // reports the box at the SAME image coordinates (we're testing
+        // that the tracker correctly interprets this as "target moved in
+        // the world" OR "same world target, just compensated") — what's
+        // important is that the track SURVIVES and its relative-frame
+        // output stays sane (inside `[0, 1]`).
+        let transform: Box<dyn crate::camera_motion::CoordinateTransformation> =
+            Box::new(TranslationTransformation::new([-0.3, 0.0]));
+        let det2 = Detection::new(nalgebra::DMatrix::from_row_slice(
+            1,
+            4,
+            &[0.4, 0.4, 0.6, 0.6],
+        ))
+        .unwrap();
+        let active = tracker.update(vec![det2], 1, Some(&*transform));
+        assert_eq!(
+            active.len(),
+            1,
+            "Track must survive the transform transition"
+        );
+        assert_eq!(active[0].global_id, id_before, "Track id must be preserved");
+
+        // Relative estimate (what consumers read for display / control)
+        // must be inside the image — not shifted 0.3 beyond the edge by
+        // a naive back-conversion.
+        let rel = active[0].get_estimate(false);
+        let cx = (rel[(0, 0)] + rel[(0, 2)]) * 0.5;
+        let cy = (rel[(0, 1)] + rel[(0, 3)]) * 0.5;
+        assert!(
+            cx > 0.3 && cx < 0.7,
+            "Relative cx should stay around 0.5, got {}",
+            cx
+        );
+        assert!(
+            cy > 0.3 && cy < 0.7,
+            "Relative cy should stay around 0.5, got {}",
+            cy
+        );
+    }
+
+    /// Rebasing across two NON-identity transforms: filter state accumulated
+    /// under transform A must be converted into transform B's absolute
+    /// frame before matching against measurements in transform B.
+    #[test]
+    fn test_rebasing_between_two_nonidentity_transforms() {
+        use crate::camera_motion::TranslationTransformation;
+
+        let mut config = TrackerConfig::from_distance_name("iou", 0.9);
+        config.hit_counter_max = 5;
+        config.initialization_delay = 0;
+        let mut tracker = Tracker::new(config).unwrap();
+
+        let tf_a: Box<dyn crate::camera_motion::CoordinateTransformation> =
+            Box::new(TranslationTransformation::new([-0.1, 0.0]));
+        let tf_b: Box<dyn crate::camera_motion::CoordinateTransformation> =
+            Box::new(TranslationTransformation::new([-0.25, 0.1]));
+
+        // Frame 1 with transform A. Box centered at image (0.5, 0.5).
+        let det = Detection::new(nalgebra::DMatrix::from_row_slice(
+            1,
+            4,
+            &[0.4, 0.4, 0.6, 0.6],
+        ))
+        .unwrap();
+        let active = tracker.update(vec![det], 1, Some(&*tf_a));
+        assert_eq!(active.len(), 1);
+        let id_before = active[0].global_id;
+
+        // Frame 2 with transform B — same image-frame detection. The
+        // track must survive and output stable relative coords.
+        let det = Detection::new(nalgebra::DMatrix::from_row_slice(
+            1,
+            4,
+            &[0.4, 0.4, 0.6, 0.6],
+        ))
+        .unwrap();
+        let active = tracker.update(vec![det], 1, Some(&*tf_b));
+        assert_eq!(active.len(), 1, "Track must survive transform change");
+        assert_eq!(active[0].global_id, id_before, "Track id must be preserved");
+
+        let rel = active[0].get_estimate(false);
+        let cx = (rel[(0, 0)] + rel[(0, 2)]) * 0.5;
+        let cy = (rel[(0, 1)] + rel[(0, 3)]) * 0.5;
+        assert!(
+            cx > 0.3 && cx < 0.7,
+            "Relative cx should stay around 0.5, got {}",
+            cx
+        );
+        assert!(
+            cy > 0.3 && cy < 0.7,
+            "Relative cy should stay around 0.5, got {}",
+            cy
+        );
     }
 }
